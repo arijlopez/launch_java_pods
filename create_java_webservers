@@ -1,0 +1,208 @@
+---
+- name: CREATE JAVA POD
+  hosts: localhost
+  connection: local
+  become: False
+  gather_facts: False
+  vars:
+    region_vars:
+      us-east-1:
+        vpc: "{{ vpc_east_1 }}"
+        elb_certificate_id: "{{ elb_cert_east_1 }}"
+        web_ami: ami-6edd3078
+        key_name: master-vpc-keypair-ansible
+        zones:
+          - name: us-east-1b
+            update_install_day: 2
+            update_install_time: 2
+          - name: us-east-1c
+            update_install_day: 4
+            update_install_time: 2
+      eu-west-1:
+        vpc: "{{ vpc_west_1 }}"
+        elb_certificate_id: "{{ elb_cert_west_1 }}"
+        web_ami: ami-58a1a73e
+        key_name: master-vpc-keypair-ansible
+        zones:
+          - name: eu-west-1b
+            update_install_day: 2
+            update_install_time: 2
+          - name: eu-west-1c
+            update_install_day: 4
+            update_install_time: 2
+
+  tasks:
+    - name: Provision web security group
+      ec2_group:
+        name: "{{ region }}-{{ customer }}-{{ pod_name }}-web"
+        description: "Security group for {{ customer }} {{ pod_name}} web tier"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            group_name: "{{ region }}-{{ customer }}-{{ pod_name }}-web"
+        rules_egress:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+        vpc_id: "{{ region_vars[region].vpc }}"
+      register: web_security_group
+
+    - name: Provision web instances
+      ec2:
+        region: "{{ region }}" # cpops sends this information
+        group:
+          - "{{ region }}-{{ customer }}-{{ pod_name }}-web"
+          - "{{ region }}-prod-HOSTING-general-web-SG"
+          - "{{ region }}-prod-SHDSVCS-Linux-SG"
+        instance_type: "{{ instance_type }}" # cpops sends
+        vpc_subnet_id: "{{ item.web_subnet }}" # {{ vpc.zones[zone].subnet }}
+        zone: "{{ item.name }}"
+        key_name: "{{ region_vars[region].key_name }}" # Get via Prompt (List)
+        image: "{{ region_vars[region].web_ami }}"
+        user_data: "{{ lookup('template', 'userdata.txt.j2') }}"
+        volumes:
+          - device_name: /dev/sda1
+            volume_type: gp2
+            volume_size: 128
+            delete_on_termination: true
+            #encrypted: true # EBS boot volumes cant be encrypted, must be AMI
+          - device_name: /dev/xvdb
+            volume_type: gp2
+            volume_size: 128
+            delete_on_termination: true
+            encrypted: true
+        wait: true
+        exact_count: "{{ count }}"
+        count_tag:
+          customer: "{{ customer }}"
+          pod_name: "{{ pod_name }}"
+          zone: "{{ item.name }}"
+          type: "web"
+        instance_tags:
+          Name: "{{ item.name }}-{{ customer }}-{{ pod_name }}-web"
+          customer: "{{ customer }}"
+          pod_name: "{{ pod_name }}"
+          service: hosting
+          zone: "{{ item.name }}"
+          type: "web"
+      with_items: "{{ region_vars[region].zones }}"
+      register: ec2_instances
+
+    - name: set ec2 instance facts
+      set_fact:
+        ec2_instance_sets: "{{ ec2_instances.results|map(attribute='tagged_instances')|list }}"
+        ec2_instance_ids: []
+        ec2_instance_ips: []
+
+    - name: set ec2 instance ids and ips
+      set_fact:
+        ec2_instance_ids: "{{ [ item['id'] ] + ec2_instance_ids }}"
+        ec2_instance_ips: "{{ [ item['private_ip'] ] + ec2_instance_ips }}"
+
+      with_items: "{{ ec2_instance_sets }}"
+
+    - name: re-tag instances to be unique
+      ec2_tag:
+        region: "{{ region }}"
+        resource: "{{ item['id'] }}"
+        tags:
+          Name: "{{ item['id']|replace('i-','') }}-{{ customer }}-{{ item['tags']['pod_name'] }}-web-{{ item['tags']['zone'] }}"
+          management: ansible
+          platform: linux
+      with_items: "{{ ec2_instance_sets }}"
+
+    - name: Gather volumes
+      ec2_vol:
+        instance: "{{ item['id' ]}}"
+        state: list
+        region: "{{ region }}"
+      with_items: "{{ ec2_instance_sets }}"
+      register: ec2_vol_out
+
+    - name: Extract volume sets
+      set_fact:
+        vol_sets: "{{ ec2_vol_out.results|map(attribute='volumes')|list}}"
+
+    - name: Tag system volumes
+      ec2_tag:
+        region: "{{ region }}"
+        resource: "{{ item['id'] }}"
+        tags:
+          Name: system
+          service: hosting
+          customer: "{{ customer }}"
+          pod_name: "{{ pod_name }}"
+          type: "web"
+      with_items: "{{ vol_sets }}"
+      when: not item['encrypted']
+
+    - name: Tag data volumes
+      ec2_tag:
+        region: "{{ region }}"
+        resource: "{{ item['id'] }}"
+        tags:
+          Name: data
+          service: hosting
+          customer: "{{ customer }}"
+          pod_name: "{{ pod_name }}"
+          type: "web"
+      with_items: "{{ vol_sets }}"
+      when: item['encrypted']
+
+    - name: Provision ELB
+      ec2_elb_lb:
+        name: "{{ customer }}-{{ pod_name }}"
+        region: "{{ region }}"
+        cross_az_load_balancing: yes
+        state: present
+        subnets:
+          - "{{ region_vars[region].zones[0].dmz_subnet }}"
+          - "{{ region_vars[region].zones[1].dmz_subnet }}"
+        security_group_names:
+          - "{{ region }}-{{ customer }}-{{ pod_name }}-web"
+        instance_ids: "{{ ec2_instance_ids }}"
+        tags:
+          customer: "{{ customer }}"
+          pod_name: "{{ pod_name }}"
+          service: hosting
+          type: web
+        listeners:
+          - protocol: http
+            load_balancer_port: 80
+            instance_port: 80
+            proxy_protocol: True
+          - protocol: https
+            load_balancer_port: 443
+            instance_protocol: http
+            instance_port: 80
+            ssl_certificate_id: "{{ region_vars[region].elb_certificate_id }}"
+        health_check:
+          ping_protocol: http
+          ping_port: 80
+          ping_path: "/healthcheck.jsp"
+          response_timeout: 5
+          interval: 30
+          unhealthy_threshold: 2
+          healthy_threshold: 10
+
+    - name: wait for instances to come up
+      wait_for:
+        port: 22
+        host: "{{ item }}"
+        timeout: 600
+      with_items: "{{ ec2_instance_ips }}"
